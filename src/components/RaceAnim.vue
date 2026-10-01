@@ -54,6 +54,8 @@ const activeEvent = computed(() => {
   return ev && now.value - ev.t < 2.4 ? ev : null
 })
 const result = computed(() => rec.value.result)
+// 本场结算联动的赛季合约：justClaimed=当场一次性兑现，gain=累计进进度但尚未兑现
+const contracts = ref({ justClaimed: [], gain: [] })
 // 赛道分段几何：可行驶区间 6% → 94%（宽 88%），三等分
 const TRACK_L = 6, TRACK_W = 88
 const segDividers = [1, 2].map(i => +(TRACK_L + TRACK_W / 3 * i).toFixed(2))
@@ -85,8 +87,10 @@ async function finish() {
   // 结算以服务器比赛记录为唯一依据；接口本身幂等，断线重放也不会重复发奖
   const r = await store.settleRace(props.race.id)
   settling.value = false
-  if (r.ok) showSettle.value = true
-  else {
+  if (r.ok) {
+    contracts.value = r.contracts || { justClaimed: [], gain: [] }
+    showSettle.value = true
+  } else {
     settleCalled = false
     store.tip(r.msg || '结算失败，请重试')
     // 记录可能已被重启时的历史修复作废：拉取最新状态，使航线/资源/战绩回到服务器口径
@@ -101,6 +105,7 @@ function skipToEnd() {
 }
 function replay() {
   now.value = 0; showSettle.value = false; lastSaved = -1; lastTs = 0
+  contracts.value = { justClaimed: [], gain: [] } // 回放只展示结果，不呈现当场兑现的合约
   raf = requestAnimationFrame(tick)
 }
 async function goBack() {
@@ -232,6 +237,18 @@ onUnmounted(() => { if (raf) cancelAnimationFrame(raf) })
           <div class="s-row" v-else><span>部件磨损</span><b style="color:#ff9fb0">-{{ result.wear }}</b></div>
           <div class="s-row"><span>声望</span><b>+{{ result.repGain }}</b></div>
           <div class="s-row"><span>总用时</span><b>{{ player.total.toFixed(2) }}s</b></div>
+
+          <!-- 赛季合约联动：符合条件（天气/名次/租赁艇）的本场成绩自动累计，达标当场一次性兑现 -->
+          <template v-if="isLive && (contracts.justClaimed.length || contracts.gain.length)">
+            <div class="s-ct-h">🚩 赛季赞助合约</div>
+            <div v-for="ct in contracts.justClaimed" :key="'c' + ct.id" class="s-ct claim">
+              <span>🎉 {{ ct.name }} 合约达成并兑现</span><b>+¥{{ ct.reward }} · 声望+{{ ct.rep }}</b>
+            </div>
+            <div v-for="ct in contracts.gain" :key="'g' + ct.id" class="s-ct">
+              <span>{{ ct.name }}</span><b>进度 {{ ct.progress }} / {{ ct.goal }}</b>
+            </div>
+          </template>
+
           <div v-if="isLive" class="s-note">奖励已一次性结算到车队账户</div>
           <button class="btn primary s-btn" @click="goBack">{{ isLive ? '返回航线 ▶' : '返回 ✕' }}</button>
           <button v-if="!isLive" class="btn ghost s-btn" @click="replay">↻ 重新回放</button>

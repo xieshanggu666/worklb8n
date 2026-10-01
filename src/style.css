@@ -244,6 +244,11 @@ input:focus { border-color: var(--gold); }
 .s-btn { width: 78%; margin-top: 8px; }
 .s-tag { font-size: 11px; font-weight: 800; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
 .s-note { width: 86%; font-size: 11px; color: var(--mint); margin-top: 2px; }
+.s-ct-h { width: 92%; font-size: 11.5px; font-weight: 800; color: var(--gold); border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 4px; }
+.s-ct { width: 92%; display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); }
+.s-ct b { color: var(--txt); font-weight: 700; white-space: nowrap; }
+.s-ct.claim { color: var(--mint); }
+.s-ct.claim b { color: var(--mint); }
 .settle-mask { position: absolute; inset: 0; z-index: 8; background: rgba(10,12,34,.6); display: grid; place-items: center; }
 .settle-spin { padding: 16px 26px; border-radius: 16px; background: rgba(20,22,58,.95); border: 1px solid rgba(255,215,106,.5); font-weight: 800; font-size: 14px; color: var(--gold); }
 
@@ -326,7 +331,10 @@ input:focus { border-color: var(--gold); }
 .pts-label { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .sp-card { padding: 12px 14px; border-radius: 14px; background: var(--glass); border: 1px solid var(--line); margin-bottom: 10px; }
 .sp-card.done { border-color: var(--mint); }
-.sp-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 9px; }
+.sp-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.sp-title { font-size: 12.5px; color: var(--txt); font-weight: 600; margin-bottom: 7px; }
+.sp-conds { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
+.ct-chip { font-size: 11px; font-weight: 600; }
 .sp-bar { margin-bottom: 8px; }
 .sp-reward { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
 .race-rows { display: flex; flex-direction: column; gap: 8px; }

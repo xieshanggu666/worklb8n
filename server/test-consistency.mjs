@@ -120,6 +120,9 @@ async function scenarioA() {
     eq('越站赛站5重置未完成', s.circuits[4].finished, 0)
     eq('越站记录不出现在历史战绩', s.races.filter(x => x.id === a.raceId || x.id === b.raceId).length, 0)
     eq('越站流水已删除', s.log.filter(l => l.race_id === a.raceId || l.race_id === b.raceId).length, 0)
+    // 合约（races 口径）进度只数未作废的已结算比赛：越站记录作废后进度清零、无合约兑现
+    eq('越站作废后全部合约进度归零', s.sponsors.reduce((z, x) => z + (x.progress || 0), 0), 0)
+    eq('越站作废后无合约处于已兑现', s.sponsors.filter(x => x.earned).length, 0)
 
     const rt = s.rentalHistory.find(x => x.id === rid)
     ok('归还记录仍在历史（回写而非删除）', !!rt)
@@ -284,8 +287,183 @@ async function scenarioD() {
   } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
 }
 
+/* ============ 场景 E：赛季合约正向链路——按天气/名次/租赁艇累计，达标一次性兑现，幂等 ============ */
+// 把一条 running 比赛记录的玩家名次改成第 1 名（同步改 pts/money 与 racer 排序无关键引用）
+function forcePlayerFirst(dbh, raceId) {
+  const row = dbh.prepare('SELECT record FROM races WHERE id=?').get(raceId)
+  const rec = JSON.parse(row.record)
+  rec.racers.forEach(r => { r.isPlayer = false })
+  const fastest = rec.racers.reduce((a, b) => (a.total <= b.total ? a : b))
+  fastest.isPlayer = true
+  fastest.name = '苍穹疾风战队'
+  Object.assign(rec.result, { rank: 1, pts: 25 })
+  dbh.prepare('UPDATE races SET record=? WHERE id=?').run(JSON.stringify(rec), raceId)
+  return rec
+}
+async function scenarioE() {
+  console.log('\n[场景 E] 可配置赛季合约：条件累计 + 达标一次性兑现 + 结算幂等 + 归还后不丢进度')
+  const PORT = 4405
+  const dir = makeSandbox()
+  let proc
+  try {
+    proc = startServer(dir, PORT)
+    let s = await waitReady(PORT)
+    const money0 = s.team.money
+    const byName = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('云帆合约目标=2 场（雾天完赛）', byName['云帆工坊'].spec.goal, 2)
+    eq('星罗合约目标=2 场（恶劣天气前3）', byName['星罗航空'].spec.goal, 2)
+    eq('流风合约目标=2 场（租赁艇登台）', byName['流风动力'].spec.goal, 2)
+    eq('苍穹合约目标=4 场（前3名）', byName['苍穹商会'].spec.goal, 4)
+    eq('全新库合约初始进度=0', s.sponsors.reduce((a, x) => a + x.progress, 0), 0)
+    eq('全新库初始均未兑现', s.sponsors.filter(x => x.earned).length, 0)
+
+    // 第 1 站「晨雾浮岛」雾：云帆 +1、星罗 +1（前3）、苍穹 +1
+    let st = await post(PORT, '/api/races/start/1', {})
+    s = await waitReady(PORT)
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    let r = await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    ok('第1站结算成功', r.ok && !r.already)
+    ok('第1站无当场兑现合约', r.contracts.justClaimed.length === 0)
+    eq('第1站有 3 条合约累计到进度', r.contracts.gain.length, 3)
+    s = await api(PORT, '/api/state')
+    let sp = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('云帆进度 1/2', sp['云帆工坊'].progress, 1)
+    eq('星罗进度 1/2', sp['星罗航空'].progress, 1)
+    eq('苍穹进度 1/4', sp['苍穹商会'].progress, 1)
+    eq('流风进度 0（自有艇）', sp['流风动力'].progress, 0)
+    eq('第1站未发任何合约奖励', s.team.money, money0 + st.race.record.result.money)
+
+    // 第 2 站「雷鸣云谷」雷暴：星罗 +1（达标兑现 8000/15）、苍穹 +1；云帆不计（非雾）
+    st = await post(PORT, '/api/races/start/2', {})
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    r = await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    eq('第2站当场兑现 1 条（星罗）', r.contracts.justClaimed.map(x => x.name).join(','), '星罗航空')
+    eq('当场兑现金额=8000', r.contracts.justClaimed[0].reward, 8000)
+    eq('第2站推进但未兑现=苍穹 1 条', r.contracts.gain.map(x => x.name).join(','), '苍穹商会')
+    s = await api(PORT, '/api/state')
+    sp = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('星罗已兑现', sp['星罗航空'].earned, 1)
+    eq('星罗好感+10', sp['星罗航空'].affinity, 70)
+    const moneyAfter2 = s.team.money
+
+    // 重复结算：合约兑现幂等，不二次发奖
+    r = await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    ok('重复结算返回幂等', r.ok && r.already)
+    s = await api(PORT, '/api/state')
+    eq('重复结算资金不变（合约不二次兑现）', s.team.money, moneyAfter2)
+    eq('星罗仍只兑现一次', s.sponsors.find(x => x.name === '星罗航空').earned, 1)
+
+    // 第 3 站「翡翠群岛」晴：仅苍穹 +1
+    st = await post(PORT, '/api/races/start/3', {})
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    await post(PORT, `/api/races/${st.race.id}/settle`, {})
+
+    // 签约雨燕（押金2400+租金600=3000，2 场）跑第 4 站「风暴裂谷」雨：流风 +1、星罗已兑现不再提示、苍穹 +1
+    const rent = await post(PORT, '/api/rentals/rent', { id: 1 })
+    ok('租艇签约成功', rent.ok)
+    st = await post(PORT, '/api/races/start/4', {})
+    eq('第4站为租赁艇出赛（开赛快照）', !!st.race.record.factors.rental, true)
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    s = await api(PORT, '/api/state')
+    sp = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('流风进度 1/2（租赁艇登台）', sp['流风动力'].progress, 1)
+    eq('苍穹进度 4/4 已兑现 22000', sp['苍穹商会'].progress, 4)
+    eq('苍穹已兑现标记=1', sp['苍穹商会'].earned, 1)
+    eq('星罗已 3/2（达标后进度继续累计）', sp['星罗航空'].progress, 3)
+
+    // 第 5 站「极光穹顶」风（租约第 2 场）：流风 +1 达标兑现 14000
+    st = await post(PORT, '/api/races/start/5', {})
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    r = await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    eq('第5站当场兑现流风', r.contracts.justClaimed.map(x => x.name).join(','), '流风动力')
+
+    // 归还租艇（磨损小，押金退款）不影响已累计的合约进度
+    const ret = await post(PORT, '/api/rentals/return', {})
+    ok('归还成功', ret.ok)
+    s = await api(PORT, '/api/state')
+    sp = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('归还后流风进度保留 2/2', sp['流风动力'].progress, 2)
+    eq('归还后流风仍已兑现', sp['流风动力'].earned, 1)
+
+    // 第 6 站「星界之巅」雾（自有艇）：云帆 +1 达标兑现 4000
+    st = await post(PORT, '/api/races/start/6', {})
+    {
+      const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+      forcePlayerFirst(dbh, st.race.id); dbh.close()
+    }
+    r = await post(PORT, `/api/races/${st.race.id}/settle`, {})
+    eq('第6站当场兑现云帆', r.contracts.justClaimed.map(x => x.name).join(','), '云帆工坊')
+    s = await api(PORT, '/api/state')
+    eq('全季 6 站完赛', s.seasonDone, 6)
+    const claimed = s.sponsors.filter(x => x.earned)
+    eq('四条合约全部兑现', claimed.length, 4)
+    const contractMoney = claimed.reduce((a, x) => a + x.reward, 0)
+    eq('合约兑现总额=4000+8000+14000+22000', contractMoney, 48000)
+    // 资金守恒：初始 + 6 场奖金 + 合约奖励 −（押金+租金）+ 归还退款
+    const bonuses = s.log.reduce((a, x) => a + x.money, 0)
+    const expected = money0 + bonuses + 48000 - 3000 + ret.refund
+    eq('资金账目与合约一次性兑现一致', Math.round(s.team.money), Math.round(expected))
+    const repGain = claimed.reduce((a, x) => a + x.rep, 0)
+    eq('声望含合约兑现加成（+8+15+22+32=77）', repGain, 77)
+    proc.kill('SIGKILL'); await sleep(120)
+  } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
+}
+
+/* ============ 场景 F：老固定积分型赞助启动迁移（metric=pts，兑现/回滚口径不变） ============ */
+async function scenarioF() {
+  console.log('\n[场景 F] 老库固定积分型赞助迁移：spec=pts 积分口径，已兑现状态与奖励保持一致')
+  const PORT = 4406
+  const dir = makeSandbox()
+  let proc
+  try {
+    const dbh = await bootSeeded(dir, PORT)
+    // 抹掉新列并恢复成老 sponsors 结构语义：target/earned/reward/rep
+    dbh.prepare('UPDATE sponsors SET spec=NULL, progress=0').run()
+    const legacy = [['云帆工坊', 12, 0], ['星罗航空', 22, 0], ['流风动力', 32, 1], ['苍穹商会', 45, 1]]
+    legacy.forEach(([n, t, e]) => dbh.prepare('UPDATE sponsors SET target=?, earned=? WHERE name=?').run(t, e, n))
+    // 老口径：积分 35 → target=32 已兑现（流风），45 未达标但标记已兑现（苍穹）需冲回
+    dbh.prepare('UPDATE team SET season_pts=?, money=money+?, rep=rep+? WHERE id=1').run(35, 14000, 22)
+    dbh.close()
+
+    proc = startServer(dir, PORT)
+    const s = await waitReady(PORT)
+    proc.kill('SIGKILL'); proc = null; await sleep(120)
+    const sp = Object.fromEntries(s.sponsors.map(x => [x.name, x]))
+    eq('迁移后云帆为 pts 口径', sp['云帆工坊'].spec.metric, 'pts')
+    eq('迁移后云帆进度=当前积分 35', sp['云帆工坊'].progress, 35)
+    eq('云帆 35>=12 已兑现', sp['云帆工坊'].earned, 1)
+    eq('星罗 35>=22 已兑现', sp['星罗航空'].earned, 1)
+    eq('流风维持已兑现（迁移前已发奖不重复）', sp['流风动力'].earned, 1)
+    eq('苍穹 35<45 未达标 → 冲回为未兑现', sp['苍穹商会'].earned, 0)
+    eq('苍穹进度=35/45', sp['苍穹商会'].progress, 35)
+    // 冲回苍穹 22000/32，补发云帆 4000/8、星罗 8000/15；流风不动
+    const dbh2 = new DatabaseSync(path.join(dir, 'sky.db'))
+    const t = dbh2.prepare('SELECT money,rep FROM team WHERE id=1').get()
+    eq('资金=35分基线+14000 +4000+8000−22000', t.money, 20000 + 14000 + 4000 + 8000 - 22000)
+    eq('声望=50+22 +8+15−32', t.rep, 50 + 22 + 8 + 15 - 32)
+    dbh2.close()
+  } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
+}
+
 const run = async () => {
   await scenarioA(); await scenarioB(); await scenarioC(); await scenarioD()
+  await scenarioE(); await scenarioF()
   console.log(`\n🎉 全部 ${pass} 项断言通过：结算 / 归还 / 越站回滚边界统一，幂等且赛季数据一致`)
 }
 run().catch(e => { console.error('\n❌ 验证失败：', e); process.exit(1) })

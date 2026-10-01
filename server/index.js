@@ -89,6 +89,80 @@ for (const s of RENTAL_SHIPS) {
   if (!ok) throw new Error('[SKY] 租赁艇型配置非法：' + JSON.stringify(s))
 }
 
+/* ================= 赛季赞助合约：可配置条件与目标（服务端唯一事实来源） =================
+ * 取代老的「固定积分达标」型赞助：每条合约声明统计口径 metric 与一组比赛条件 cond，
+ * 每场比赛结算后，按本赛季全部「已结算且未作废」比赛重新累计进度，达标即一次性兑现
+ * 全额资金/声望（只发一次）；之后因越站回滚导致进度掉回目标以下时，奖励同口径冲回。
+ *
+ * metric：
+ *  - 'races'（默认）：符合 cond 的已结算比赛「场次数」
+ *  - 'pts'          ：本赛季累计积分（老固定积分型的兼容口径，此时 cond 应为空）
+ * cond 为 AND 组合，可同时声明（字段缺省 = 不限制）：
+ *  - weather: 天气白名单（晴/风/雨/雾/雷暴）
+ *  - rankMax: 本场名次上限（含，如 3 = 前 3 名）
+ *  - rental : 是否租赁艇出赛（true/false，以开赛快照 factors.rental 为准）
+ */
+const WEATHER_SET = new Set(Object.keys(WEATHER))
+const SEASON_CONTRACTS = [
+  {
+    name: '云帆工坊', reward: 4000, rep: 8, metric: 'races', goal: 2,
+    title: '雾天完赛 2 场', cond: { weather: ['雾'] }
+  },
+  {
+    name: '星罗航空', reward: 8000, rep: 15, metric: 'races', goal: 2,
+    title: '恶劣天气（雨/雾/雷暴）进站前 3 名 2 次', cond: { weather: ['雨', '雾', '雷暴'], rankMax: 3 }
+  },
+  {
+    name: '流风动力', reward: 14000, rep: 22, metric: 'races', goal: 2,
+    title: '驾驶租赁艇 2 次登台（前 3 名）', cond: { rental: true, rankMax: 3 }
+  },
+  {
+    name: '苍穹商会', reward: 22000, rep: 32, metric: 'races', goal: 4,
+    title: '全季 4 次登台（前 3 名）', cond: { rankMax: 3 }
+  }
+]
+for (const ct of SEASON_CONTRACTS) {
+  const cond = ct.cond || {}
+  const condOk =
+    (cond.weather === undefined || (Array.isArray(cond.weather) && cond.weather.length && cond.weather.every(w => WEATHER_SET.has(w)))) &&
+    (cond.rankMax === undefined || (Number.isInteger(cond.rankMax) && cond.rankMax >= 1 && cond.rankMax <= 20)) &&
+    (cond.rental === undefined || typeof cond.rental === 'boolean')
+  const ok = typeof ct.name === 'string' && ct.name.trim() && typeof ct.title === 'string' && ct.title.trim() &&
+    ['races', 'pts'].includes(ct.metric) && Number.isInteger(ct.goal) && ct.goal > 0 &&
+    Number.isInteger(ct.reward) && ct.reward > 0 && Number.isInteger(ct.rep) && ct.rep >= 0 &&
+    condOk && !(ct.metric === 'pts' && Object.keys(cond).length)
+  if (!ok) throw new Error('[SKY] 赛季合约配置非法：' + JSON.stringify(ct))
+}
+function contractSpec(s) {
+  let spec = null
+  try { spec = s.spec ? JSON.parse(s.spec) : null } catch (e) { spec = null }
+  // 老库行（无 spec）：按固定积分型合约解析，与升级前口径完全一致
+  if (!spec) spec = { metric: 'pts', goal: Number(s.target) || 0, cond: {}, title: `赛季积分达到 ${s.target}`, legacy: true }
+  spec.cond ||= {}
+  spec.goal = Number(spec.goal) || (Number(s.target) || 0)
+  spec.metric = spec.metric === 'pts' ? 'pts' : 'races'
+  return spec
+}
+// 单场比赛是否命中合约条件（AND）；rec 为比赛记录，rank 以记录预先确定的最终名次为准
+function matchContract(rec, rank, cond) {
+  if (cond.weather && !cond.weather.includes(rec.factors.weather)) return false
+  if (cond.rankMax !== undefined && !(rank <= cond.rankMax)) return false
+  if (cond.rental !== undefined && !!rec.factors.rental !== cond.rental) return false
+  return true
+}
+// 合约当前进度：races 口径只数本赛季 status='settled' 的比赛（void 记录不计数）；
+// pts 口径与老固定积分型一致，直接取车队本赛季积分（单一事实来源，积分被回滚时同步回落）
+function contractProgress(spec, season) {
+  if (spec.metric === 'pts') return Number(teamCore().season_pts) || 0
+  const rows = all("SELECT record, rank FROM races WHERE status='settled' AND season=?", season)
+  return rows.reduce((n, r) => {
+    let rec = null
+    try { rec = JSON.parse(r.record) } catch (e) { rec = null }
+    const rank = r.rank ?? rec?.result?.rank ?? 99
+    return n + (rec && matchContract(rec, rank, spec.cond) ? 1 : 0)
+  }, 0)
+}
+
 function seed() {
   if (get('SELECT COUNT(*) c FROM team').c > 0) return
   run('INSERT INTO team (name) VALUES (?)', '苍穹疾风战队')
@@ -100,8 +174,12 @@ function seed() {
   ups.forEach(([n, slot, stat, bonus, price]) => run('INSERT INTO upgrades (name,slot,stat,bonus,price) VALUES (?,?,?,?,?)', n, slot, stat, bonus, price))
   const cir = [['晨雾浮岛','1','雾'],['雷鸣云谷','2','雷暴'],['翡翠群岛','3','晴'],['风暴裂谷','3','雨'],['极光穹顶','4','风'],['星界之巅','5','雾']]
   cir.forEach(([n, d, w]) => run('INSERT INTO circuits (name,diff,weather,bonus_pts) VALUES (?,?,?,?)', n, Number(d), w, Number(d) * 4))
-  const spo = [['云帆工坊', 12, 4000, 8], ['星罗航空', 22, 8000, 15], ['流风动力', 32, 14000, 22], ['苍穹商会', 45, 22000, 32]]
-  spo.forEach(([n, t, r, rep]) => run('INSERT INTO sponsors (name,target,reward,rep) VALUES (?,?,?,?)', n, t, r, rep))
+  // 赞助商=可配置赛季合约：metric/goal/条件标题全部来自 SEASON_CONTRACTS 配置
+  SEASON_CONTRACTS.forEach(ct => {
+    const spec = { metric: ct.metric, goal: ct.goal, cond: ct.cond || {}, title: ct.title }
+    run('INSERT INTO sponsors (name,target,reward,rep,spec,progress) VALUES (?,?,?,?,?,0)',
+      ct.name, ct.goal, ct.reward, ct.rep, JSON.stringify(spec))
+  })
 }
 export function teamCore() { return get('SELECT * FROM team WHERE id=1') }
 export function airship() { return all('SELECT * FROM airships')[0] || { speed: 60, dur: 80, turn: 55, acc: 60, parts_dur: 100, hp: 100, name: '云雀·I', id: 1 } }
@@ -365,8 +443,19 @@ function settleRace(id) {
           row.circuit_id, row.id, rec.season, rank, pts, money, note, now())
         run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, rep_gain=?, settled_at=? WHERE id=?",
           rank, pts, money, wear, repGain, now(), row.id)
-        reconcileSponsors() // 同一事务内对账赞助商
-        result = { ok: true, already: false, race: parseRace(getRaceRow(id)) }
+        // 同一事务内重算赛季合约：按全部已结算比赛累计进度，达标合约一次性兑现全额奖励
+        const beforeEarned = new Set(all('SELECT id FROM sponsors WHERE earned=1').map(x => x.id))
+        const contracts = reconcileContracts(rec.season, row.id)
+        const justClaimed = contracts
+          .filter(ct => ct.reached && !beforeEarned.has(ct.id))
+          .map(ct => ({ id: ct.id, name: ct.name, reward: ct.reward, rep: ct.rep }))
+        const contractGain = contracts
+          .filter(ct => ct.gained && !ct.reached)
+          .map(ct => ({ id: ct.id, name: ct.name, progress: ct.progress, goal: ct.spec.goal }))
+        result = {
+          ok: true, already: false, race: parseRace(getRaceRow(id)),
+          contracts: { justClaimed, gain: contractGain }
+        }
       }
     }
     db.exec('COMMIT')
@@ -376,21 +465,50 @@ function settleRace(id) {
   }
   return result
 }
-// 赞助商对账：以当前赛季积分为唯一事实来源，earned 与是否达标保持一致
-function reconcileSponsors() {
-  const pts = Number(teamCore().season_pts) || 0
-  all('SELECT * FROM sponsors').forEach(s => {
-    if (!s.reward) return
-    const reached = pts >= (Number(s.target) || 0)
-    const earned = !!s.earned
-    if (reached && !earned) {
+// 赛季合约对账：以本赛季全部已结算比赛为唯一事实来源重算每条合约进度，
+// 「达标（progress>=goal）」与「已兑现 earned」必须保持一致：
+//  - 刚达标：在调用方所在事务内一次性发放全额资金/声望，earned=1、好感+10；
+//  - 掉回未达标（越站作废回滚导致）：全额冲回，earned=0、好感-10。
+// 奖金只在「未兑现→已兑现」跨越上发放一次，重复调用/结算重放不会重复发奖。
+// 返回合约重算明细 [{ id,name,reward,rep,spec,progress,reached,gained }]；
+// gained=本场是否为该合约贡献进度（由调用方传入的比赛 id 判定，供结算卡提示）。
+function reconcileContracts(season, gainRaceId = null) {
+  const rows = all('SELECT * FROM sponsors').map(s => {
+    const spec = contractSpec(s)
+    const progress = contractProgress(spec, season)
+    const reached = spec.goal > 0 && progress >= spec.goal
+    const was = !!s.earned
+    if (reached && !was) {
       run('UPDATE team SET money=money+?, rep=rep+? WHERE id=1', s.reward, s.rep)
-      run('UPDATE sponsors SET earned=1, affinity=affinity+10 WHERE id=?', s.id)
-    } else if (!reached && earned) {
+      run('UPDATE sponsors SET earned=1, progress=?, affinity=affinity+10 WHERE id=?', progress, s.id)
+    } else if (!reached && was) {
       run('UPDATE team SET money=money-?, rep=rep-? WHERE id=1', s.reward, s.rep)
-      run('UPDATE sponsors SET earned=0, affinity=affinity-10 WHERE id=?', s.id)
+      run('UPDATE sponsors SET earned=0, progress=?, affinity=affinity-10 WHERE id=?', progress, s.id)
+    } else if ((s.progress || 0) !== progress) {
+      run('UPDATE sponsors SET progress=? WHERE id=?', progress, s.id)
+    }
+    return {
+      id: s.id, name: s.name, reward: s.reward, rep: s.rep, spec, progress, reached,
+      claimed: reached, gained: false
     }
   })
+  // 标记本场是否为该合约贡献了进度（供结算卡提示）：该场已结算且命中合约条件
+  if (gainRaceId) {
+    const grow = get("SELECT record, rank FROM races WHERE id=? AND status='settled'", gainRaceId)
+    if (grow) {
+      let rec = null
+      try { rec = JSON.parse(grow.record) } catch (e) { rec = null }
+      if (rec) {
+        const rank = grow.rank ?? rec?.result?.rank ?? 99
+        rows.forEach(r => {
+          r.gained = r.spec.metric === 'races'
+            ? matchContract(rec, rank, r.spec.cond)
+            : (Number(rec?.result?.pts) || 0) > 0
+        })
+      }
+    }
+  }
+  return rows
 }
 
 // 历史数据兼容（迁移补偿）：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的
@@ -446,7 +564,7 @@ function reconcileLegacySkips() {
         ptsBack, netMoney, repBack)
     }
 
-    reconcileSponsors()
+    reconcileContracts(Number(teamCore().season) || 1)
     const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
     run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
     db.exec('COMMIT')
@@ -460,7 +578,29 @@ function reconcileLegacySkips() {
     throw e
   }
 }
+// 老库迁移：固定积分型赞助（无 spec）→ 可配置赛季合约。
+// 保留其「积分达标」口径（metric=pts），升级前后兑现/回滚行为完全一致；迁移幂等
+// （已有 spec 的行不动），随后统一重算一次使 progress 与当前战绩对齐。
+function migrateLegacySponsors() {
+  let n = 0
+  db.exec('BEGIN')
+  try {
+    all('SELECT * FROM sponsors').forEach(s => {
+      if (s.spec) return
+      const spec = { metric: 'pts', goal: Number(s.target) || 0, cond: {}, title: `赛季积分达到 ${s.target}`, legacy: true }
+      run('UPDATE sponsors SET spec=? WHERE id=?', JSON.stringify(spec), s.id)
+      n++
+    })
+    reconcileContracts(Number(teamCore()?.season) || 1)
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  if (n) console.log(`[SKY] 已将 ${n} 条固定积分型赞助迁移为可配置赛季合约（积分口径保持不变）`)
+}
 seed()
+migrateLegacySponsors()
 reconcileLegacySkips()
 
 /* ---------- 共享响应 ---------- */
@@ -471,7 +611,8 @@ const payload = () => {
   const pilots = all('SELECT * FROM pilots')
   const mechanics = all('SELECT * FROM mechanics')
   const circuits = orderedCircuits()
-  const sponsors = all('SELECT * FROM sponsors')
+  // 赞助合约：附带解析后的 spec（metric/goal/cond/title），渲染条件与进度条均以此为准
+  const sponsors = all('SELECT * FROM sponsors').map(s => ({ ...s, spec: contractSpec(s) }))
   const log = all('SELECT * FROM race_log ORDER BY id DESC')
   const done = circuits.filter(c => c.finished).length
   // 中断续看：当前未结算的比赛（每场仅一场 running）；history 供历史回放

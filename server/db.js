@@ -65,11 +65,15 @@ CREATE TABLE IF NOT EXISTS circuits (
 CREATE TABLE IF NOT EXISTS sponsors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  target INTEGER DEFAULT 0,
-  earned INTEGER DEFAULT 0,
+  target INTEGER DEFAULT 0,            -- 合约目标进度（= spec.goal，便于 SQL/老库兼容）
+  earned INTEGER DEFAULT 0,            -- 是否已一次性兑现（唯一闸门，幂等/回滚同口径）
   reward INTEGER DEFAULT 0,
   rep INTEGER DEFAULT 0,
-  affinity INTEGER DEFAULT 60
+  affinity INTEGER DEFAULT 60,
+  -- 可配置赛季合约：metric=races 按符合 conditions 的场次累计（天气/名次/租赁艇 AND 组合）；
+  -- metric=pts 按赛季积分累计（老固定积分型兼容）。progress 每场结算后由已结算比赛重算。
+  spec TEXT,                           -- { metric, goal, cond, title, legacy? }（JSON，服务端配置）
+  progress INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS race_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +134,9 @@ CREATE TABLE IF NOT EXISTS races (
 try { db.exec('ALTER TABLE race_log ADD COLUMN race_id INTEGER') } catch (e) {}
 // 老库兼容：races 增加 voided_at 列（越站历史修复作废记录用）
 try { db.exec('ALTER TABLE races ADD COLUMN voided_at TEXT') } catch (e) {}
+// 老库兼容：赞助商升级为可配置赛季合约（spec 配置 + progress 累计进度）
+try { db.exec('ALTER TABLE sponsors ADD COLUMN spec TEXT') } catch (e) {}
+try { db.exec('ALTER TABLE sponsors ADD COLUMN progress INTEGER DEFAULT 0') } catch (e) {}
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }
