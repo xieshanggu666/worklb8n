@@ -89,6 +89,84 @@ for (const s of RENTAL_SHIPS) {
   if (!ok) throw new Error('[SKY] 租赁艇型配置非法：' + JSON.stringify(s))
 }
 
+/* ================= 赛季合约：条款配置（服务端唯一事实来源） =================
+ * 取代旧版「固定积分达标」赞助：每份合约由若干条款组成，进度按本赛季已结算比赛
+ * （天气 / 最终名次 / 开赛时的租赁艇快照）累计，全部条款（或 need 指定条数）达成后，
+ * 在结算事务内一次性兑现资金 + 声望。条款口径与奖励一律由这份配置核定，客户端不可改写。
+ *
+ * 条款类型：
+ *  - points : 赛季积分累计达到 value
+ *  - weather: 在 weather 指定天气下完赛 value 场（weather 省略或为 '*' = 任意天气）
+ *  - rank   : 取得 rankMax 名以内（含）完赛 value 场（rankMax 省略 = 任意名次）
+ *  - rental : 以租赁艇完赛 value 场；ship 指定租赁艇型 id；ship 省略 = 任意租赁艇
+ *  - race   : 同一场比赛同时满足 weather/rankMax/ship 条件即计 1 场，value 场（复合条款）
+ */
+const VALID_TERM_TYPES = ['points', 'weather', 'rank', 'rental', 'race']
+const CONTRACT_SEASON = 1
+const CONTRACTS = [
+  {
+    id: 1, name: '云帆工坊 · 积分赞助', note: '赛季积分达标，基础赞助照常兑现',
+    terms: [{ type: 'points', value: 12 }],
+    reward: 4000, rep: 8
+  },
+  {
+    id: 2, name: '星罗航空 · 全天候完赛', note: '在雨、雾、雷暴的恶劣云况下各完成一场分站赛',
+    terms: [
+      { type: 'weather', weather: '雨', value: 1 },
+      { type: 'weather', weather: '雾', value: 1 },
+      { type: 'weather', weather: '雷暴', value: 1 }
+    ],
+    reward: 8000, rep: 15
+  },
+  {
+    id: 3, name: '流风动力 · 领奖台合约', note: '两次以前三名冲线，或至少一场以租赁艇代赛（任一达成即兑现）',
+    need: 1,
+    terms: [
+      { type: 'rank', rankMax: 3, value: 2 },
+      { type: 'rental', value: 1 }
+    ],
+    reward: 14000, rep: 22
+  },
+  {
+    id: 4, name: '苍穹商会 · 赛季之巅', note: '积分 45 分，并在雷暴云谷租赁旗舰艇夺冠',
+    terms: [
+      { type: 'points', value: 45 },
+      { type: 'race', weather: '雷暴', rankMax: 1, ship: 4, value: 1 }
+    ],
+    reward: 22000, rep: 32
+  }
+]
+// 条款合法性自检：非法合约配置必须在启动时就暴露，而不是等玩家差一场才发现条款无效
+function validateTerms(terms) {
+  if (!Array.isArray(terms) || !terms.length) return false
+  return terms.every(t => {
+    if (!t || typeof t !== 'object' || !VALID_TERM_TYPES.includes(t.type)) return false
+    if (!Number.isInteger(t.value) || t.value <= 0) return false
+    if ('weather' in t && t.weather !== '*' && !(t.weather in WEATHER)) return false
+    if ('rankMax' in t && (!Number.isInteger(t.rankMax) || t.rankMax < 1 || t.rankMax > 6)) return false
+    if ('ship' in t && (!Number.isInteger(t.ship) || !RENTAL_MAP.has(t.ship))) return false
+    // 天气白名单（不含 '*'）只对天气语义条款有意义；rental/race 额外条件用上面的字段校验
+    return true
+  })
+}
+for (const c of CONTRACTS) {
+  const ok = typeof c.name === 'string' && c.name.trim() &&
+    validateTerms(c.terms) &&
+    Number.isInteger(c.reward) && c.reward >= 0 &&
+    Number.isInteger(c.rep) && c.rep >= 0 &&
+    (c.need === undefined || (Number.isInteger(c.need) && c.need >= 1 && c.need <= c.terms.length))
+  if (!ok) throw new Error('[SKY] 赛季合约配置非法：' + JSON.stringify(c))
+  c.need = c.need ?? c.terms.length
+}
+
+// 老库迁移：旧版只有固定积分型 sponsors 表。升级后 contracts 为空时，按当前服务端配置
+// 补建合约（条款为配置快照）；随后由启动对账按本赛季已结算战绩决定是否立即兑现，幂等。
+function ensureContracts() {
+  if (get('SELECT COUNT(*) c FROM contracts').c > 0) return
+  CONTRACTS.forEach(c => run(
+    'INSERT INTO contracts (name,season,note,terms,need,reward,rep) VALUES (?,?,?,?,?,?,?)',
+    c.name, CONTRACT_SEASON, c.note || '', JSON.stringify({ v: 1, terms: c.terms }), c.need, c.reward, c.rep))
+}
 function seed() {
   if (get('SELECT COUNT(*) c FROM team').c > 0) return
   run('INSERT INTO team (name) VALUES (?)', '苍穹疾风战队')
@@ -100,8 +178,10 @@ function seed() {
   ups.forEach(([n, slot, stat, bonus, price]) => run('INSERT INTO upgrades (name,slot,stat,bonus,price) VALUES (?,?,?,?,?)', n, slot, stat, bonus, price))
   const cir = [['晨雾浮岛','1','雾'],['雷鸣云谷','2','雷暴'],['翡翠群岛','3','晴'],['风暴裂谷','3','雨'],['极光穹顶','4','风'],['星界之巅','5','雾']]
   cir.forEach(([n, d, w]) => run('INSERT INTO circuits (name,diff,weather,bonus_pts) VALUES (?,?,?,?)', n, Number(d), w, Number(d) * 4))
-  const spo = [['云帆工坊', 12, 4000, 8], ['星罗航空', 22, 8000, 15], ['流风动力', 32, 14000, 22], ['苍穹商会', 45, 22000, 32]]
-  spo.forEach(([n, t, r, rep]) => run('INSERT INTO sponsors (name,target,reward,rep) VALUES (?,?,?,?)', n, t, r, rep))
+  CONTRACTS.forEach(c => run(
+    'INSERT INTO contracts (name,season,note,terms,need,reward,rep) VALUES (?,?,?,?,?,?,?)',
+    c.name, CONTRACT_SEASON, c.note || '',
+    JSON.stringify({ v: 1, terms: c.terms }), c.need, c.reward, c.rep))
 }
 export function teamCore() { return get('SELECT * FROM team WHERE id=1') }
 export function airship() { return all('SELECT * FROM airships')[0] || { speed: 60, dur: 80, turn: 55, acc: 60, parts_dur: 100, hp: 100, name: '云雀·I', id: 1 } }
@@ -121,7 +201,7 @@ export function fleetStats() {
   const up = all('SELECT * FROM upgrades WHERE equipped=1')
   const s = { speed: a.speed, dur: a.dur, turn: a.turn, acc: a.acc, name: a.name, id: a.id, parts_dur: a.parts_dur, hp: a.hp ?? 100 }
   up.forEach(u => { s[u.stat] = (s[u.stat] || 0) + u.bonus })
-  if (rt) s.rental = { id: rt.id, name: rt.name, racesLeft: rt.max_races - rt.races_used, maxRaces: rt.max_races, wearTotal: rt.wear_total }
+  if (rt) s.rental = { id: rt.id, shipId: rt.ship_id, name: rt.name, racesLeft: rt.max_races - rt.races_used, maxRaces: rt.max_races, wearTotal: rt.wear_total }
   return s
 }
 function leadPilot() { return all('SELECT * FROM pilots ORDER BY (skill+courage) DESC')[0] || null }
@@ -241,8 +321,8 @@ function buildRace(c) {
         acc: st.acc - mods.filter(m => m.stat === 'acc').reduce((a, m) => a + m.bonus, 0),
         dur: st.dur - mods.filter(m => m.stat === 'dur').reduce((a, m) => a + m.bonus, 0) },
       parts_dur: st.parts_dur,
-      // 本场出赛租约快照：结算时磨损记入该租约；null = 自有艇出赛
-      rental: st.rental ? { id: st.rental.id, name: st.rental.name } : null,
+      // 本场出赛租约快照：结算时磨损记入该租约；shipId 供合约条款按指定艇型判定；null = 自有艇出赛
+      rental: st.rental ? { id: st.rental.id, shipId: st.rental.shipId, name: st.rental.name } : null,
       mods,
       pilot: pilot ? { id: pilot.id, name: pilot.name, skill: pilot.skill, courage: pilot.courage, exp: pilot.exp, mood: pilot.mood } : null,
       mech: mech ? { id: mech.id, name: mech.name, skill: mech.skill, mood: mech.mood } : null,
@@ -314,7 +394,7 @@ function settleRace(id) {
   const row = getRaceRow(id)
   if (!row) return { ok: false, status: 404, msg: '比赛记录不存在' }
   if (row.status === 'void') return { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
-  if (row.settled) return { ok: true, already: true, race: parseRace(row) } // 幂等：重复结算直接返回，不重复发奖
+  if (row.settled) return { ok: true, already: true, race: parseRace(row), contractsPaid: [], contractsRevoked: [] } // 幂等：重复结算直接返回，不重复发奖、不重复兑现合约
 
   const rec = JSON.parse(row.record)
   const c = get('SELECT * FROM circuits WHERE id=?', row.circuit_id)
@@ -326,7 +406,7 @@ function settleRace(id) {
     if (again.status === 'void') {
       result = { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
     } else if (again.settled) {
-      result = { ok: true, already: true, race: parseRace(again) }
+      result = { ok: true, already: true, race: parseRace(again), contractsPaid: [], contractsRevoked: [] }
     } else if (c?.finished) {
       // 极端兜底：赛站已被另一场比赛结算 → 本条记录作废，绝不重复发奖，也不混入历史战绩
       run("UPDATE races SET status='void', settled=0, voided_at=? WHERE id=?", now(), row.id)
@@ -365,8 +445,9 @@ function settleRace(id) {
           row.circuit_id, row.id, rec.season, rank, pts, money, note, now())
         run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, rep_gain=?, settled_at=? WHERE id=?",
           rank, pts, money, wear, repGain, now(), row.id)
-        reconcileSponsors() // 同一事务内对账赞助商
-        result = { ok: true, already: false, race: parseRace(getRaceRow(id)) }
+        const contractSettle = reconcileContracts(rec.season) // 同一事务内对账赛季合约（累计进度→一次性兑现）
+        const settledRow = parseRace(getRaceRow(id))
+        result = { ok: true, already: false, race: settledRow, contractsPaid: contractSettle.paid, contractsRevoked: contractSettle.revoked }
       }
     }
     db.exec('COMMIT')
@@ -376,19 +457,128 @@ function settleRace(id) {
   }
   return result
 }
-// 赞助商对账：以当前赛季积分为唯一事实来源，earned 与是否达标保持一致
-function reconcileSponsors() {
-  const pts = Number(teamCore().season_pts) || 0
-  all('SELECT * FROM sponsors').forEach(s => {
-    if (!s.reward) return
-    const reached = pts >= (Number(s.target) || 0)
-    const earned = !!s.earned
-    if (reached && !earned) {
-      run('UPDATE team SET money=money+?, rep=rep+? WHERE id=1', s.reward, s.rep)
-      run('UPDATE sponsors SET earned=1, affinity=affinity+10 WHERE id=?', s.id)
-    } else if (!reached && earned) {
-      run('UPDATE team SET money=money-?, rep=rep-? WHERE id=1', s.reward, s.rep)
-      run('UPDATE sponsors SET earned=0, affinity=affinity-10 WHERE id=?', s.id)
+/* ================= 赛季合约：进度引擎 + 一次性兑现对账 =================
+ * 进度不入库：始终以本赛季「已结算且未作废」的比赛记录为唯一事实来源现算
+ * （weather=赛道天气，rank=最终名次，rental=开赛快照中的租赁艇/艇型）。
+ * 积分条款直接以 team.season_pts 为准——积分本身已由每场结算与越站回滚维护。
+ * 全部条款（或 need 指定条数）达成即在结算事务内一次性兑现资金 + 声望；
+ * 若因越站作废等导致进度跌破门槛，则冲回奖励，与正向口径完全对称，函数幂等。
+ */
+function parseTerms(row) {
+  try {
+    const j = JSON.parse(row.terms)
+    return Array.isArray(j) ? j : (j?.terms || []) // 兼容裸数组老快照
+  } catch (e) { return [] }
+}
+// 租赁艇型 id 的稳健解析：新记录快照带 shipId；老记录只有租约行 id，需查库回推目录艇型
+function raceShipId(rec) {
+  const rtSnap = rec?.factors?.rental
+  if (!rtSnap) return null
+  if (Number.isInteger(rtSnap.shipId)) return rtSnap.shipId
+  const rtRow = get('SELECT ship_id FROM rentals WHERE id=?', rtSnap.id)
+  return rtRow?.ship_id ?? null
+}
+// 单场比赛是否命中条款的附加条件（weather / rankMax / ship）
+function raceMatch(rec, t) {
+  const w = rec?.circuit?.weather ?? rec?.factors?.weather
+  if (t.weather && t.weather !== '*' && w !== t.weather) return false
+  if (Number.isInteger(t.rankMax) && (rec.result.rank ?? 6) > t.rankMax) return false
+  if ('ship' in t && raceShipId(rec) !== t.ship) return false
+  return true
+}
+// 计算一份条款在给定已结算比赛集合上的累计进度 { value, target }
+function termProgress(term, races, pts) {
+  const target = term.value
+  let value = 0
+  if (term.type === 'points') {
+    value = pts
+  } else if (term.type === 'weather') {
+    value = races.filter(r => raceMatch(r, term)).length
+  } else if (term.type === 'rank') {
+    value = races.filter(r => raceMatch(r, term)).length
+  } else if (term.type === 'rental') {
+    // ship 缺省 = 任意租赁艇；指定 ship 时由 raceMatch 校验艇型
+    value = races.filter(r => !!r.factors?.rental && raceMatch(r, term)).length
+  } else if (term.type === 'race') {
+    // 复合条款：天气 + 名次 + 租赁艇（可含指定艇型）必须在同一场比赛同时满足
+    value = races.filter(r => !!r.factors?.rental && raceMatch(r, term)).length
+  }
+  return { value, target, reached: value >= target }
+}
+// 合约整体进度：每条条款的进度 + 是否满足 need 条
+function contractView(row, races, pts) {
+  const terms = parseTerms(row)
+  const items = terms.map(t => ({ term: t, ...termProgress(t, races, pts) }))
+  const need = Math.min(row.need || items.length || 1, items.length)
+  const doneCount = items.filter(i => i.reached).length
+  return { terms: items, need, doneCount, reached: items.length > 0 && doneCount >= need }
+}
+// 取某赛季全部已结算、未作废比赛的解析记录（合约进度的唯一统计口径）
+function settledRaceRecs(season) {
+  return all("SELECT * FROM races WHERE status='settled' AND settled=1 AND season=? ORDER BY id ASC", season)
+    .map(r => { try { return JSON.parse(r.record) } catch (e) { return null } })
+    .filter(Boolean)
+}
+// 合约对账（与旧赞助对账同一边界）：达成即一次性兑现，跌破即冲回；幂等。
+// 返回 { paid:[...], revoked:[...] }，结算卡据此展示当场兑现的合约。
+function reconcileContracts(season = teamCore().season) {
+  const t = teamCore()
+  const pts = Number(t.season_pts) || 0
+  const races = settledRaceRecs(season)
+  const paid = [], revoked = []
+  all('SELECT * FROM contracts WHERE season=?', season).forEach(c => {
+    if (!c.reward && !c.rep) return
+    const view = contractView(c, races, pts)
+    const wasEarned = !!c.earned
+    if (view.reached && !wasEarned) {
+      run('UPDATE team SET money=money+?, rep=rep+? WHERE id=1', c.reward, c.rep)
+      run('UPDATE contracts SET earned=1, paid_at=? WHERE id=?', now(), c.id)
+      paid.push({ id: c.id, name: c.name, reward: c.reward, rep: c.rep })
+    } else if (!view.reached && wasEarned) {
+      run('UPDATE team SET money=MAX(0,money-?), rep=MAX(0,rep-?) WHERE id=1', c.reward, c.rep)
+      run('UPDATE contracts SET earned=0, paid_at=NULL WHERE id=?', c.id)
+      revoked.push({ id: c.id, name: c.name, reward: c.reward, rep: c.rep })
+    }
+  })
+  return { paid, revoked }
+}
+// 条款展示文案（服务端生成，前端直接渲染；目标值/艇型口径不在客户端拼接）
+function termLabel(t) {
+  const n = t.value
+  switch (t.type) {
+    case 'points': return `赛季积分达到 ${n}`
+    case 'weather': return `${(t.weather && t.weather !== '*') ? t.weather : '任意天气'}完赛 ${n} 场`
+    case 'rank': {
+      const place = Number.isInteger(t.rankMax) ? `前 ${t.rankMax} 名` : '任意名次'
+      return `${place}完赛 ${n} 场`
+    }
+    case 'rental': {
+      const ship = 'ship' in t ? RENTAL_MAP.get(t.ship)?.name || '指定艇型' : '租赁艇'
+      return `驾驶${ship}完赛 ${n} 场`
+    }
+    case 'race': {
+      const parts = []
+      if (t.weather && t.weather !== '*') parts.push(t.weather)
+      parts.push(Number.isInteger(t.rankMax) ? `取得前 ${t.rankMax} 名` : '完赛')
+      if ('ship' in t) parts.push(`驾驶${RENTAL_MAP.get(t.ship)?.name || '指定艇型'}`)
+      else parts.push('驾驶租赁艇')
+      return `${parts.join('、')} ${n} 场`
+    }
+    default: return '未知条款'
+  }
+}
+// 对外合约视图：配置条款 + 实时累计进度 + 兑现状态
+function contractsPayload(season = teamCore().season) {
+  const t = teamCore()
+  const pts = Number(t.season_pts) || 0
+  const races = settledRaceRecs(season)
+  return all('SELECT * FROM contracts WHERE season=? ORDER BY id ASC', season).map(c => {
+    const view = contractView(c, races, pts)
+    return {
+      id: c.id, name: c.name, note: c.note, season: c.season,
+      reward: c.reward, rep: c.rep, earned: !!c.earned, paidAt: c.paid_at,
+      need: view.need, doneCount: view.doneCount,
+      terms: view.terms.map(i => ({ type: i.term.type, label: termLabel(i.term), value: i.value, target: i.target, reached: i.reached }))
     }
   })
 }
@@ -400,8 +590,8 @@ function reconcileSponsors() {
 //      并补退押金差额（与 settleRace / 归还结算共用同一磨损归属边界）；
 //   2) 删除对应 race_log 流水（含无记录关联的老版残留流水）；
 //   3) 将这些赛站的 races 记录一律置为 void（作废，不再出现在历史战绩、不能续看或再结算）；
-//   4) 重置赛站，再统一重算赞助商对账与赛季名次。
-// 所有资金改动（奖金冲回、押金补退、赞助对账）在同一事务边界一次完成；函数天然幂等：
+//   4) 重置赛站，再统一重算赛季合约对账与赛季名次。
+// 所有资金改动（奖金冲回、押金补退、合约兑现/冲回）在同一事务边界一次完成；函数天然幂等：
 // 已作废的记录与已删流水在重启时不会被再次统计，已回写的租约退款也不会二次补退。
 function reconcileLegacySkips() {
   const cs = orderedCircuits()
@@ -446,7 +636,7 @@ function reconcileLegacySkips() {
         ptsBack, netMoney, repBack)
     }
 
-    reconcileSponsors()
+    reconcileContracts()
     const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
     run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
     db.exec('COMMIT')
@@ -461,7 +651,12 @@ function reconcileLegacySkips() {
   }
 }
 seed()
+ensureContracts()
 reconcileLegacySkips()
+// 启动兜底：无越站可修（或老库/注入数据导致合约状态与战绩不一致）时，上面的修复不会跑对账；
+// 这里再幂等对账一次，使「已兑现」始终与本赛季已结算战绩一致（重复执行不产生二次发奖）
+db.exec('BEGIN')
+try { reconcileContracts(); db.exec('COMMIT') } catch (e) { db.exec('ROLLBACK'); throw e }
 
 /* ---------- 共享响应 ---------- */
 const payload = () => {
@@ -471,14 +666,14 @@ const payload = () => {
   const pilots = all('SELECT * FROM pilots')
   const mechanics = all('SELECT * FROM mechanics')
   const circuits = orderedCircuits()
-  const sponsors = all('SELECT * FROM sponsors')
+  const contracts = contractsPayload(t.season)
   const log = all('SELECT * FROM race_log ORDER BY id DESC')
   const done = circuits.filter(c => c.finished).length
   // 中断续看：当前未结算的比赛（每场仅一场 running）；history 供历史回放
   const activeRow = get("SELECT * FROM races WHERE status='running' ORDER BY id DESC LIMIT 1")
   const raceRows = all("SELECT * FROM races WHERE status='settled' ORDER BY id DESC")
   return {
-    team: t, airship: st, upgrades, pilots, mechanics, circuits, sponsors, log,
+    team: t, airship: st, upgrades, pilots, mechanics, circuits, contracts, log,
     shop: SHOP_ITEMS,
     // 租赁：当前生效租约（null=自有艇出赛）、艇型目录与最近归还记录
     rental: activeRental(),
@@ -727,7 +922,7 @@ app.post('/api/races/:id/settle', (req, res) => {
 
 // 重置（重置数据到初始种子）
 app.post('/api/reset', (_, res) => {
-  ['race_log', 'races', 'rentals', 'sponsors', 'circuits', 'upgrades', 'mechanics', 'pilots', 'airships', 'team'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
+  ['race_log', 'races', 'rentals', 'contracts', 'circuits', 'upgrades', 'mechanics', 'pilots', 'airships', 'team'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
   try { run('DELETE FROM sqlite_sequence') } catch (e) {}
   seed()
   res.json({ ok: true })

@@ -15,6 +15,9 @@ const now = ref(0)
 const showSettle = ref(false)
 const settling = ref(false)
 const showFactors = ref(false)
+// 本场结算事务内一次性兑现（或因进度不足冲回）的赛季合约，幂等重放不重复展示
+const contractsPaid = ref([])
+const contractsRevoked = ref([])
 let settleCalled = false
 let lastSaved = -1
 let raf = null
@@ -85,8 +88,11 @@ async function finish() {
   // 结算以服务器比赛记录为唯一依据；接口本身幂等，断线重放也不会重复发奖
   const r = await store.settleRace(props.race.id)
   settling.value = false
-  if (r.ok) showSettle.value = true
-  else {
+  if (r.ok) {
+    contractsPaid.value = r.contractsPaid || []
+    contractsRevoked.value = r.contractsRevoked || []
+    showSettle.value = true
+  } else {
     settleCalled = false
     store.tip(r.msg || '结算失败，请重试')
     // 记录可能已被重启时的历史修复作废：拉取最新状态，使航线/资源/战绩回到服务器口径
@@ -231,6 +237,13 @@ onUnmounted(() => { if (raf) cancelAnimationFrame(raf) })
           </div>
           <div class="s-row" v-else><span>部件磨损</span><b style="color:#ff9fb0">-{{ result.wear }}</b></div>
           <div class="s-row"><span>声望</span><b>+{{ result.repGain }}</b></div>
+          <!-- 赛季合约在结算事务内一次性兑现（幂等，重放不重复发奖） -->
+          <div v-for="c in contractsPaid" :key="'p' + c.id" class="s-row ct-pay">
+            <span>🚩 合约兑现 · {{ c.name }}</span><b>+¥{{ c.reward }} · 声望+{{ c.rep }}</b>
+          </div>
+          <div v-for="c in contractsRevoked" :key="'r' + c.id" class="s-row ct-pay revoke">
+            <span>🚩 合约未达标 · {{ c.name }}</span><b>-¥{{ c.reward }} · 声望-{{ c.rep }}</b>
+          </div>
           <div class="s-row"><span>总用时</span><b>{{ player.total.toFixed(2) }}s</b></div>
           <div v-if="isLive" class="s-note">奖励已一次性结算到车队账户</div>
           <button class="btn primary s-btn" @click="goBack">{{ isLive ? '返回航线 ▶' : '返回 ✕' }}</button>

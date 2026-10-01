@@ -62,14 +62,20 @@ CREATE TABLE IF NOT EXISTS circuits (
   rank INTEGER,
   finished INTEGER DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS sponsors (
+-- 赛季合约（取代固定积分型赞助）：条款为服务端配置快照（terms JSON），
+-- 进度不入库——始终从本赛季已结算比赛记录（天气/名次/租约快照）现算，
+-- 达成全部（或 need 指定数量）条款即在结算事务内一次性兑现奖励；earned=唯一闸门
+CREATE TABLE IF NOT EXISTS contracts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  target INTEGER DEFAULT 0,
-  earned INTEGER DEFAULT 0,
-  reward INTEGER DEFAULT 0,
-  rep INTEGER DEFAULT 0,
-  affinity INTEGER DEFAULT 60
+  season INTEGER NOT NULL DEFAULT 1,
+  note TEXT DEFAULT '',            -- 合约一句话说明（展示用）
+  terms TEXT NOT NULL,             -- {v,terms:[...]} 条款配置快照（服务端配置，客户端不可改写）
+  need INTEGER NOT NULL,           -- 需达成的条款数（=条款总数即全部达成）
+  reward INTEGER NOT NULL DEFAULT 0,
+  rep INTEGER NOT NULL DEFAULT 0,
+  earned INTEGER NOT NULL DEFAULT 0,
+  paid_at TEXT
 );
 CREATE TABLE IF NOT EXISTS race_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

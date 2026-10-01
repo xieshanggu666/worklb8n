@@ -244,6 +244,10 @@ input:focus { border-color: var(--gold); }
 .s-btn { width: 78%; margin-top: 8px; }
 .s-tag { font-size: 11px; font-weight: 800; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
 .s-note { width: 86%; font-size: 11px; color: var(--mint); margin-top: 2px; }
+.ct-pay { color: var(--mint); }
+.ct-pay b { color: var(--mint); }
+.ct-pay.revoke { color: var(--pink, #ff9fb0); }
+.ct-pay.revoke b { color: var(--pink, #ff9fb0); }
 .settle-mask { position: absolute; inset: 0; z-index: 8; background: rgba(10,12,34,.6); display: grid; place-items: center; }
 .settle-spin { padding: 16px 26px; border-radius: 16px; background: rgba(20,22,58,.95); border: 1px solid rgba(255,215,106,.5); font-weight: 800; font-size: 14px; color: var(--gold); }
 
@@ -329,6 +333,17 @@ input:focus { border-color: var(--gold); }
 .sp-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 9px; }
 .sp-bar { margin-bottom: 8px; }
 .sp-reward { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
+.ct-card .ct-note { font-size: 11px; color: var(--muted); margin: -4px 0 8px; }
+.ct-term { display: grid; grid-template-columns: 16px 1fr auto 72px; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px; }
+.ct-term .ct-tick { color: var(--muted); text-align: center; }
+.ct-term.ok .ct-tick { color: var(--mint); }
+.ct-term .ct-label { color: var(--txt); }
+.ct-term.ok .ct-label { color: var(--mint); }
+.ct-prog { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.ct-prog.done { color: var(--mint); font-weight: 700; }
+.ct-bar { height: 6px; }
+.ct-bar > i { background: linear-gradient(90deg, var(--sky), var(--mint)); }
+.ct-term.ok .ct-bar > i { background: var(--mint); }
 .race-rows { display: flex; flex-direction: column; gap: 8px; }
 .race-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; background: var(--glass); border: 1px solid var(--line); }
 .rname { flex: 1; font-weight: 600; font-size: 13px; }

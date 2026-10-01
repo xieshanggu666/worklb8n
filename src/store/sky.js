@@ -9,6 +9,8 @@ export const useSkyStore = defineStore('sky', {
     team: s => s.state?.team || {},
     airship: s => s.state?.airship || {},
     circuits: s => s.state?.circuits || [],
+    // 赛季合约（服务端配置条款 + 按已结算战绩实时累计的进度）
+    contracts: s => s.state?.contracts || [],
     upgrades: s => s.state?.upgrades || [],
     // 零件商店目录（价格/属性来自服务端配置，客户端不可改写）
     shop: s => s.state?.shop || [],

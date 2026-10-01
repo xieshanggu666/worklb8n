@@ -30,7 +30,7 @@ function makeSandbox() {
 }
 // 起一份全新服务：完成首次建表 + seed（不做脏修复），随即停服，返回直连 DB 供注入脏数据
 async function bootSeeded(dir, port) {
-  const proc = spawn('node', ['index.js'], { cwd: dir, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' })
+  const proc = spawn(process.execPath, ['index.js'], { cwd: dir, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' })
   let state = null
   for (let i = 0; i < 100; i++) {
     try { state = await api(port, '/api/state'); if (state && state.team && state.circuits.length) break }
@@ -42,7 +42,7 @@ async function bootSeeded(dir, port) {
   return new DatabaseSync(path.join(dir, 'sky.db'))
 }
 function startServer(dir, port) {
-  return spawn('node', ['index.js'], { cwd: dir, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' })
+  return spawn(process.execPath, ['index.js'], { cwd: dir, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' })
 }
 async function waitReady(port) {
   for (let i = 0; i < 100; i++) {
@@ -52,14 +52,16 @@ async function waitReady(port) {
   throw new Error('server not ready')
 }
 
-// 造一条指定赛站、指定结果/租约快照的「已结算」越站记录及配套流水、赛站完赛标记
-function injectSettledRace(dbh, { circuitId, rank, money, wear, repGain, pts, rentalId, rentalName }) {
+// 造一条指定赛站、指定结果/租约快照的「已结算」越站记录及配套流水、赛站完赛标记。
+// weather / shipId 用于赛季合约条款（天气、指定租赁艇型）的进度统计。
+function injectSettledRace(dbh, { circuitId, rank, money, wear, repGain, pts, rentalId, rentalName, weather, shipId }) {
   const pilot = dbh.prepare('SELECT * FROM pilots ORDER BY (skill+courage) DESC LIMIT 1').get()
   const record = {
     v: 1, season: 1,
-    circuit: { id: circuitId },
+    circuit: { id: circuitId, weather: weather || null },
     factors: {
-      rental: rentalId ? { id: rentalId, name: rentalName } : null,
+      weather: weather || null,
+      rental: rentalId ? { id: rentalId, shipId: shipId ?? null, name: rentalName } : null,
       pilot: { id: pilot.id, name: pilot.name, skill: pilot.skill, courage: pilot.courage, exp: pilot.exp, mood: pilot.mood }
     },
     result: { rank, pts, money, wear, repGain }
@@ -219,8 +221,8 @@ async function scenarioC() {
     eq('出赛艇（租约）部件健康=100−磨损', s3.rental.parts_dur, 100 - wear)
     eq('出赛艇（租约）部件健康=100−磨损', s3.airship.parts_dur, 100 - wear)
     const expectMoney = moneyBefore - 3000 + started.race.record.result.money +
-      s3.sponsors.filter(x => x.earned).reduce((a, x) => a + x.reward, 0) // 结算事务内达标赞助奖励
-    eq('奖金（含同事务达标赞助奖励）只发一次', s3.team.money, expectMoney)
+      s3.contracts.filter(x => x.earned).reduce((a, x) => a + x.reward, 0) // 结算事务内兑现的合约奖励
+    eq('奖金（含同事务兑现的合约奖励）只发一次', s3.team.money, expectMoney)
 
     // 重复归还：仅一次退款
     const ret1 = await post(PORT, '/api/rentals/return', {})
@@ -284,8 +286,100 @@ async function scenarioD() {
   } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
 }
 
+/* ============ 场景 E：赛季合约按天气/名次/租赁艇累计进度，启动对账一次性兑现，重启幂等 ============ */
+async function scenarioE() {
+  console.log('\n[场景 E] 合约条款累计达成：天气×3 + 积分达标，奖金一次性兑现且幂等')
+  const PORT = 4405
+  const dir = makeSandbox()
+  let proc
+  try {
+    const dbh = await bootSeeded(dir, PORT)
+    const team0 = dbh.prepare('SELECT * FROM team WHERE id=1').get()
+    // 合约2（星罗航空）：雨/雾/雷暴各完赛 1 场，奖励 8000+15 声望
+    // 合约1（云帆工坊）：积分 12，奖励 4000+8 声望
+    const races = [
+      { circuitId: 2, weather: '雷暴', rank: 4, pts: 12, money: 900, wear: 12, repGain: 3 },
+      { circuitId: 5, weather: '风', rank: 5, pts: 10, money: 700, wear: 8, repGain: 2 },
+      { circuitId: 4, weather: '雨', rank: 3, pts: 15, money: 1300, wear: 10, repGain: 5 },
+      { circuitId: 1, weather: '雾', rank: 6, pts: 8, money: 600, wear: 6, repGain: 1 }
+    ]
+    races.forEach(r => injectSettledRace(dbh, r))
+    // 全部赛站标记完赛（无越站可修），让启动直接进入合约对账：按已结算记录累计条款进度
+    dbh.prepare('UPDATE circuits SET finished=1, rank=COALESCE(rank,4)').run()
+    const ptsSum = races.reduce((a, r) => a + r.pts, 0)
+    const moneySum = races.reduce((a, r) => a + r.money, 0)
+    const repSum = races.reduce((a, r) => a + r.repGain, 0)
+    // 模拟「比赛奖金已发、合约尚未兑现」：启动兜底对账应一次性补齐合约1+合约2
+    dbh.prepare('UPDATE team SET money=?, season_pts=?, rep=? WHERE id=1')
+      .run(team0.money + moneySum, team0.season_pts + ptsSum, team0.rep + repSum)
+    dbh.close()
+
+    proc = startServer(dir, PORT)
+    const s = await waitReady(PORT)
+    const c1 = s.contracts.find(x => x.id === 1)
+    const c2 = s.contracts.find(x => x.id === 2)
+    ok('积分合约已一次性兑现', c1.earned)
+    ok('天气合约（雨/雾/雷暴各 1 场）已一次性兑现', c2.earned && c2.doneCount === 3)
+    eq('天气条款进度为 1/1', c2.terms.every(t => t.value === 1 && t.target === 1), true)
+    const payout = 4000 + 8000
+    eq('合约奖励一次性到账（4000+8000）', s.team.money, team0.money + moneySum + payout)
+    eq('合约声望一次性到账（8+15）', s.team.rep, team0.rep + repSum + 23)
+    const c3 = s.contracts.find(x => x.id === 3)
+    const c4 = s.contracts.find(x => x.id === 4)
+    ok('领奖台+租赁艇合约未满足（无租约艇场次）', !c3.earned)
+    ok('赛季之巅合约未满足', !c4.earned)
+
+    // 重启：兑现幂等，不二次发奖；进度仍从已结算记录现算
+    proc.kill('SIGKILL'); await sleep(150); proc = null
+    proc = startServer(dir, PORT)
+    const s2 = await waitReady(PORT)
+    eq('重启后资金不变（合约不二次兑现）', s2.team.money, s.team.money)
+    eq('重启后声望不变', s2.team.rep, s.team.rep)
+    ok('重启后合约仍为已兑现', s2.contracts.find(x => x.id === 2).earned)
+    proc.kill('SIGKILL'); await sleep(120); proc = null
+  } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
+}
+
+/* ============ 场景 F：已兑现合约因越站作废导致条款进度不足 → 同事务冲回奖励，幂等 ============ */
+async function scenarioF() {
+  console.log('\n[场景 F] 越站回滚后合约条款跌破门槛：已兑现奖励按口径冲回')
+  const PORT = 4406
+  const dir = makeSandbox()
+  let proc
+  try {
+    const dbh = await bootSeeded(dir, PORT)
+    const team0 = dbh.prepare('SELECT * FROM team WHERE id=1').get()
+    // 唯一的雨/雷暴完赛场次都是越站：修复作废后天气合约三条全灭；积分也跌破 12
+    const r1 = { circuitId: 4, weather: '雨', rank: 3, pts: 15, money: 1300, wear: 10, repGain: 5 }
+    const r2 = { circuitId: 2, weather: '雷暴', rank: 2, pts: 18, money: 1500, wear: 12, repGain: 6 }
+    const a = injectSettledRace(dbh, r1)
+    const b = injectSettledRace(dbh, r2)
+    // 合约1、合约2 已处于「兑现」状态，奖励连同比赛奖励一并发过（雾场缺失，模拟为历史遗留已兑现）
+    dbh.prepare("UPDATE contracts SET earned=1, paid_at='t1' WHERE id IN (1,2)").run()
+    dbh.prepare('UPDATE team SET money=?, season_pts=?, rep=? WHERE id=1')
+      .run(team0.money + r1.money + r2.money + 4000 + 8000,
+        team0.season_pts + r1.pts + r2.pts,
+        team0.rep + r1.repGain + r2.repGain + 8 + 15)
+    dbh.close()
+
+    proc = startServer(dir, PORT)
+    const s = await waitReady(PORT)
+    proc.kill('SIGKILL'); await sleep(120); proc = null
+
+    // 越站记录作废 → 比赛奖励冲回；合约1（积分不足）与合约2（雨/雷暴场次作废、雾场本就没有）双双冲回
+    eq('资金回到修复前（比赛奖励+合约奖励全部冲回）', s.team.money, team0.money)
+    eq('积分回到修复前', s.team.season_pts, team0.season_pts)
+    eq('声望回到修复前', s.team.rep, team0.rep)
+    ok('积分合约已撤销兑现', !s.contracts.find(x => x.id === 1).earned)
+    const c2 = s.contracts.find(x => x.id === 2)
+    ok('天气合约已撤销兑现', !c2.earned)
+    eq('天气条款进度归零', c2.terms.every(t => t.value === 0), true)
+    eq('越站记录不进历史', s.races.filter(x => x.id === a.raceId || x.id === b.raceId).length, 0)
+  } finally { if (proc) proc.kill('SIGKILL'); rmSync(dir, { recursive: true, force: true }) }
+}
+
 const run = async () => {
-  await scenarioA(); await scenarioB(); await scenarioC(); await scenarioD()
-  console.log(`\n🎉 全部 ${pass} 项断言通过：结算 / 归还 / 越站回滚边界统一，幂等且赛季数据一致`)
+  await scenarioA(); await scenarioB(); await scenarioC(); await scenarioD(); await scenarioE(); await scenarioF()
+  console.log(`\n🎉 全部 ${pass} 项断言通过：结算 / 归还 / 越站回滚 / 赛季合约兑现边界统一，幂等且赛季数据一致`)
 }
 run().catch(e => { console.error('\n❌ 验证失败：', e); process.exit(1) })

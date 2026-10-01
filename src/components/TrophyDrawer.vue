@@ -18,7 +18,7 @@ function stationName(seq) { return seq < 0 || seq >= store.circuits.length ? '' 
   <div class="drawer-mask" @click.self="emit('close')">
     <aside class="drawer">
       <header class="d-h">
-        <div><h3>🏆 赛季之巅</h3><div class="d-sub">追赶积分目标，赢取赞助荣耀</div></div>
+        <div><h3>🏆 赛季之巅</h3><div class="d-sub">完成赛季合约条款，一次性赢取赞助荣耀</div></div>
         <button class="d-x" @click="emit('close')">✕</button>
       </header>
 
@@ -29,16 +29,26 @@ function stationName(seq) { return seq < 0 || seq >= store.circuits.length ? '' 
           <div class="pts-label">本赛季积分</div>
         </div>
 
-        <!-- 赞助商 -->
+        <!-- 赛季合约：按天气/名次/租赁艇等条款累计进度，全部达成后一次性兑现 -->
         <section>
-          <div class="sec-h"><b>🚩 赞助商 <span class="d-sub">达标即解锁资金与声望</span></b></div>
-          <div v-for="s in store.state?.sponsors || []" :key="s.id" class="sp-card" :class="{ done: s.earned }">
+          <div class="sec-h"><b>🚩 赛季合约 <span class="d-sub">累计条款进度，结算时一次性兑现</span></b></div>
+          <div v-for="c in store.contracts" :key="c.id" class="sp-card ct-card" :class="{ done: c.earned }">
             <div class="sp-top">
-              <b>{{ s.name }}</b>
-              <span class="tag" :class="s.earned ? 'm' : 'o'">{{ s.earned ? '✔ 已达标' : '目标 ' + s.target + ' 分' }}</span>
+              <b>{{ c.name }}</b>
+              <span class="tag" :class="c.earned ? 'm' : 'o'">
+                {{ c.earned ? '✔ 已兑现 ' + (c.paidAt || '') : `条款 ${c.doneCount}/${c.need}` }}
+              </span>
             </div>
-            <div class="hbar sp-bar"><i :style="{ width: Math.min(100, store.team.season_pts / s.target * 100) + '%' }"></i></div>
-            <div class="sp-reward"><span>奖励</span><span class="row gap8"><span class="tag o">¥{{ s.reward }}</span><span class="tag v">声望+{{ s.rep }}</span></span></div>
+            <div v-if="c.note" class="ct-note">{{ c.note }}</div>
+            <div v-for="(tm, i) in c.terms" :key="i" class="ct-term" :class="{ ok: tm.reached }">
+              <span class="ct-tick">{{ tm.reached ? '✔' : '○' }}</span>
+              <span class="ct-label">{{ tm.label }}</span>
+              <span class="ct-prog mono" :class="{ done: tm.reached }">
+                {{ tm.type === 'points' ? Math.min(tm.value, tm.target) : tm.value }}/{{ tm.target }}
+              </span>
+              <span class="hbar ct-bar"><i :style="{ width: Math.min(100, tm.value / tm.target * 100) + '%' }"></i></span>
+            </div>
+            <div class="sp-reward"><span>兑现奖励</span><span class="row gap8"><span class="tag o">¥{{ c.reward }}</span><span class="tag v">声望+{{ c.rep }}</span></span></div>
           </div>
         </section>
 
